@@ -24,6 +24,19 @@ fn query(request: &Request) -> Vec<(String, String)> {
     request.url.query_pairs().into_owned().collect()
 }
 
+fn sorted_query(request: &Request) -> Vec<(String, String)> {
+    let mut pairs = query(request);
+    pairs.sort();
+    pairs
+}
+
+fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
 fn query_value(request: &Request, name: &str) -> Option<String> {
     query(request)
         .into_iter()
@@ -196,20 +209,17 @@ async fn search_inbox_accepts_custom_params() {
         .await
         .unwrap();
 
-    let mut pairs = query(&only_request(&server).await);
-    pairs.sort();
-    let expected: Vec<(String, String)> = [
-        ("from_timestamp", "1700000000"),
-        ("limit", "5"),
-        ("offset", "10"),
-        ("subject_includes", "password reset"),
-        ("to_addr_prefix", "john@ns.mailisk.net"),
-        ("wait", "false"),
-    ]
-    .into_iter()
-    .map(|(key, value)| (key.to_owned(), value.to_owned()))
-    .collect();
-    assert_eq!(pairs, expected);
+    assert_eq!(
+        sorted_query(&only_request(&server).await),
+        pairs(&[
+            ("from_timestamp", "1700000000"),
+            ("limit", "5"),
+            ("offset", "10"),
+            ("subject_includes", "password reset"),
+            ("to_addr_prefix", "john@ns.mailisk.net"),
+            ("wait", "false"),
+        ])
+    );
 }
 
 #[tokio::test]
@@ -651,4 +661,238 @@ async fn api_errors_include_status_and_body() {
         Error::Api { body, .. } => assert!(body.contains("Invalid API key")),
         other => panic!("expected Error::Api, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn search_sms_messages_accepts_custom_params() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/sms/+15550000001/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 0,
+            "options": {"limit": 5, "offset": 10, "wait": false},
+            "data": []
+        })))
+        .mount(&server)
+        .await;
+
+    client
+        .search_sms_messages(
+            "+15550000001",
+            &SearchSmsMessagesParams {
+                limit: Some(5),
+                offset: Some(10),
+                body: Some("Your code".into()),
+                from_number: Some("+15550000002".into()),
+                direction: Some(SmsMessageDirection::Outbound),
+                from_date: Some("2026-05-11T18:00:00.000Z".into()),
+                to_date: Some("2026-05-11T18:05:00.000Z".into()),
+                wait: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sorted_query(&only_request(&server).await),
+        pairs(&[
+            ("body", "Your code"),
+            ("direction", "outbound"),
+            ("from_date", "2026-05-11T18:00:00.000Z"),
+            ("from_number", "+15550000002"),
+            ("limit", "5"),
+            ("offset", "10"),
+            ("to_date", "2026-05-11T18:05:00.000Z"),
+            ("wait", "false"),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn request_options_timeout_is_enforced() {
+    let (server, client) = setup().await;
+    Mock::given(path("/api/emails/test-namespace/inbox"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"total_count": 0, "options": {}, "data": []}))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+
+    let error = client
+        .search_inbox_with_options(
+            "test-namespace",
+            &SearchInboxParams {
+                wait: Some(false),
+                ..Default::default()
+            },
+            &RequestOptions::timeout(Duration::from_millis(100)),
+        )
+        .await
+        .unwrap_err();
+
+    match error {
+        Error::Request(error) => assert!(error.is_timeout(), "expected a timeout, got {error:?}"),
+        other => panic!("expected Error::Request, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn get_attachment_returns_metadata() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/attachments/attachment-id"))
+        .and(header("X-Api-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "id": "attachment-id",
+                "filename": "report.txt",
+                "content_type": "text/plain",
+                "size": 11,
+                "expires_at": "2026-05-11T19:00:00.000Z",
+                "download_url": "https://downloads.example/report.txt"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let attachment = client.get_attachment("attachment-id").await.unwrap().data;
+
+    assert_eq!(attachment.filename, "report.txt");
+    assert_eq!(attachment.content_type, "text/plain");
+    assert_eq!(attachment.size, 11);
+    assert_eq!(attachment.expires_at.as_deref(), Some("2026-05-11T19:00:00.000Z"));
+    assert_eq!(attachment.download_url, "https://downloads.example/report.txt");
+}
+
+#[tokio::test]
+async fn totp_methods_omit_unset_options() {
+    let (server, client) = setup().await;
+    let otp = || {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "code": "123456",
+            "expires": "2026-05-11T18:00:30.000Z"
+        }))
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/devices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 0,
+            "options": {"limit": 20, "offset": 0},
+            "items": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/devices/otp"))
+        .and(body_json(json!({"shared_secret": "JBSWY3DPEHPK3PXP"})))
+        .respond_with(otp())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/devices/device-id/otp"))
+        .respond_with(otp())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let listed = client
+        .list_totp_devices(&ListTotpDevicesParams::default())
+        .await
+        .unwrap();
+    assert!(listed.items.is_empty());
+    client
+        .get_totp_otp_by_shared_secret("JBSWY3DPEHPK3PXP", &GetTotpOtpParams::default())
+        .await
+        .unwrap();
+    client
+        .get_totp_otp_by_device_id("device-id", &GetTotpOtpParams::default())
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[0].url.query().is_none_or(str::is_empty));
+    assert!(requests[2].url.query().is_none_or(str::is_empty));
+}
+
+#[tokio::test]
+async fn post_errors_include_status_and_body() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/sms/virtual"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "statusCode": 400,
+            "message": "to_number must be a number you own"
+        })))
+        .mount(&server)
+        .await;
+
+    let error = client
+        .send_virtual_sms(&SendVirtualSmsParams {
+            from_number: "+15550000002".into(),
+            to_number: "+15550000009".into(),
+            body: "Hello".into(),
+        })
+        .await
+        .unwrap_err();
+
+    match error {
+        Error::Api { status, body } => {
+            assert_eq!(status.as_u16(), 400);
+            assert!(body.contains("to_number must be a number you own"));
+        }
+        other => panic!("expected Error::Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn download_attachment_reports_presigned_url_errors() {
+    let (server, client) = setup().await;
+    Mock::given(path("/api/attachments/attachment-id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "id": "attachment-id",
+                "filename": "report.txt",
+                "content_type": "text/plain",
+                "size": 11,
+                "expires_at": null,
+                "download_url": format!("{}/downloads/report.txt", server.uri())
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(path("/downloads/report.txt"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("Request has expired"))
+        .mount(&server)
+        .await;
+
+    let error = client.download_attachment("attachment-id").await.unwrap_err();
+
+    match error {
+        Error::Api { status, body } => {
+            assert_eq!(status.as_u16(), 403);
+            assert_eq!(body, "Request has expired");
+        }
+        other => panic!("expected Error::Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn malformed_responses_are_decode_errors() {
+    let (server, client) = setup().await;
+    Mock::given(path("/api/namespaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>Bad gateway</html>"))
+        .mount(&server)
+        .await;
+
+    let error = client.list_namespaces().await.unwrap_err();
+
+    assert!(
+        matches!(error, Error::Decode(_)),
+        "expected Error::Decode, got {error:?}"
+    );
 }
